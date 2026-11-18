@@ -9,7 +9,6 @@ import torch
 from packaging.version import Version
 from pydantic import ValidationError
 from pydantic_core import PydanticUndefined, PydanticUndefinedType
-from transformers.utils import is_torch_bf16_gpu_available
 from transformers.utils.import_utils import (
     is_torch_npu_available,
 )
@@ -28,6 +27,10 @@ from axolotl.model_support import (
     resolve_model_support,
     run_model_support_hooks,
 )
+from axolotl.utils.activation_checkpointing import (
+    hf_checkpointing_enabled,
+    offload_placement,
+)
 from axolotl.utils.bench import log_gpu_memory_usage
 from axolotl.utils.dict import DictDefault
 from axolotl.utils.logging import get_logger
@@ -37,6 +40,7 @@ from axolotl.utils.schemas.datasets import (
     SFTDataset,
     SyntheticDataset,
 )
+from axolotl.utils.schemas.utils import is_deepspeed_zero3_config
 
 LOG = get_logger(__name__)
 
@@ -159,11 +163,30 @@ def choose_device(cfg):
         cfg.device_map = None
 
 
+def is_native_bf16_gpu_available() -> bool:
+    """Return True only if the GPU natively supports bf16 (Ampere or newer).
+
+    ``transformers.utils.is_torch_bf16_gpu_available`` counts emulated bf16:
+    it calls ``torch.cuda.is_bf16_supported`` with the default
+    ``including_emulation=True``, which returns True on pre-Ampere GPUs such
+    as Turing (sm_75) where a bf16 tensor can be allocated but bf16 math is
+    emulated and much slower than fp16. ``bf16: auto`` must only pick bf16
+    when the hardware supports it natively, so check without emulation.
+    """
+    try:
+        return torch.cuda.is_bf16_supported(including_emulation=False)
+    except (RuntimeError, AssertionError):
+        return False
+
+
 def resolve_dtype(cfg):
+    if cfg.float32 and cfg.bf16 == "auto" and not cfg.fp16:
+        # AMP stays explicit with FP32 weights: `bf16: auto` does not turn autocast on
+        cfg.bf16 = False
     if (
         not cfg.fp16 and cfg.bf16 == "auto" and not cfg.use_ray
     ):  # if we use ray we want to defer this check to the worker node
-        if is_torch_bf16_gpu_available():
+        if is_native_bf16_gpu_available():
             LOG.debug("bf16 support detected, enabling for this configuration.")
             cfg.bf16 = True
         else:
@@ -190,7 +213,10 @@ def resolve_dtype(cfg):
         if cfg.bf16:
             cfg.fp16 = False
 
-    if cfg.bf16 or cfg.bfloat16:
+    # float32 sets the weight dtype only; bf16/fp16 still pick the autocast dtype
+    if cfg.float32:
+        cfg.torch_dtype = torch.float32
+    elif cfg.bf16 or cfg.bfloat16:
         cfg.torch_dtype = torch.bfloat16
     elif cfg.load_in_8bit or cfg.fp16 or cfg.float16:
         cfg.torch_dtype = torch.float16
@@ -226,6 +252,42 @@ def _validate_diffusion_lm_target(cfg, resolved_support) -> None:
             "`plugins: [axolotl.integrations.diffusion.DiffusionPlugin]`; without "
             "it training would silently fall back to causal SFT."
         )
+
+
+# Mistral Large 4: reentrant recompute drops the KV-source layer's gradient from the
+# layers sharing its KV. Gemma4: shared per-layer norms / cross-layer shared KV cause
+# "marked ready twice" errors under DDP with reentrant checkpointing.
+NON_REENTRANT_MODEL_TYPES = {
+    "mistral_large4": "Mistral Large 4",
+    "gemma4": "Gemma4",
+    "gemma4_unified": "Gemma4",
+}
+
+
+def resolve_reentrant(cfg):
+    """Settle `activation_checkpointing.reentrant` for transformers' checkpointing."""
+    if not hf_checkpointing_enabled(cfg):
+        return
+    checkpointing = cfg.activation_checkpointing
+    if checkpointing.get("reentrant") is None:
+        # Non-reentrant is PyTorch's recommended default. DeepSpeed ZeRO-3 keeps
+        # reentrant: non-reentrant recompute sees the partitioned parameters and
+        # raises a CheckpointError.
+        checkpointing["reentrant"] = bool(
+            cfg.unfrozen_parameters is None
+            and cfg.rl is None
+            and (
+                is_deepspeed_zero3_config(cfg.deepspeed)
+                or os.getenv("ACCELERATE_DEEPSPEED_ZERO_STAGE") == "3"
+            )
+        )
+    model_name = NON_REENTRANT_MODEL_TYPES.get(cfg.model_config_type)
+    if model_name and checkpointing["reentrant"] is not False:
+        LOG.warning(
+            f"{model_name} requires non-reentrant activation checkpointing. Setting "
+            "activation_checkpointing.reentrant: false."
+        )
+        checkpointing["reentrant"] = False
 
 
 def normalize_config(cfg):
@@ -311,7 +373,7 @@ def normalize_config(cfg):
     )
 
     cfg.model_config_type = model_config.model_type
-    validate_recurrent_model_config(cfg)
+    validate_recurrent_model_config(cfg, model_config)
 
     native_text_diffusion = (
         resolved_support is not None
@@ -466,36 +528,19 @@ def normalize_config(cfg):
     if isinstance(cfg.pretraining_dataset, dict):
         cfg.pretraining_dataset = [cfg.pretraining_dataset]
 
-    if (
-        cfg.gradient_checkpointing
-        and cfg.unfrozen_parameters is None
-        and cfg.gradient_checkpointing_kwargs is None
-        and cfg.rl is None
-    ):
-        cfg.gradient_checkpointing_kwargs = {"use_reentrant": True}
+    resolve_reentrant(cfg)
 
-    # Gemma4 requires use_reentrant=False for DDP (shared per-layer norms /
-    # cross-layer shared KV cause "marked ready twice" errors with reentrant
-    # checkpointing) and ddp_find_unused_parameters=True (per_layer_projection
-    # LoRA / frozen mm params may not receive gradients on every step). The
-    # unified variant shares the same constraints.
+    # Gemma4 requires ddp_find_unused_parameters=True for DDP (per_layer_projection
+    # LoRA / frozen mm params may not receive gradients on every step). The unified
+    # variant shares the same constraint.
     if cfg.model_config_type in ("gemma4", "gemma4_unified"):
-        if cfg.gradient_checkpointing:
-            if cfg.gradient_checkpointing_kwargs is None:
-                cfg.gradient_checkpointing_kwargs = {}
-            if cfg.gradient_checkpointing_kwargs.get("use_reentrant") is not False:
-                LOG.warning(
-                    "Gemma4 requires use_reentrant=False for gradient checkpointing "
-                    "in distributed training. Setting use_reentrant=False."
-                )
-                cfg.gradient_checkpointing_kwargs["use_reentrant"] = False
         if cfg.ddp and cfg.ddp_find_unused_parameters is None:
-            if cfg.activation_offloading is True:
-                # activation_offloading uses checkpoint wrappers that conflict
+            if offload_placement(cfg, "all") != "none":
+                # TRL's offloader uses checkpoint wrappers that conflict
                 # with find_unused_parameters (causes "marked ready twice").
                 # Use freeze_mm_modules instead to eliminate unused params.
                 LOG.info(
-                    "Gemma4 + DDP + activation_offloading: skipping "
+                    "Gemma4 + DDP + activation_checkpointing.offload.all: skipping "
                     "ddp_find_unused_parameters (use freeze_mm_modules to "
                     "handle unused vision/audio params)."
                 )
@@ -505,14 +550,6 @@ def normalize_config(cfg):
                     "Auto-enabling."
                 )
                 cfg.ddp_find_unused_parameters = True
-
-    # MixLoRA reads _aux_loss from the module after the forward pass; reentrant
-    # checkpointing recomputes forward under no_grad, dropping the autograd graph.
-    if cfg.adapter == "mixlora" and cfg.gradient_checkpointing:
-        if cfg.gradient_checkpointing_kwargs is None:
-            cfg.gradient_checkpointing_kwargs = {}
-        if cfg.gradient_checkpointing_kwargs.get("use_reentrant") is not False:
-            cfg.gradient_checkpointing_kwargs["use_reentrant"] = False
 
     log_gpu_memory_usage(LOG, "baseline", cfg.device)
 
@@ -543,6 +580,14 @@ def validate_config(
 ) -> DictDefault:
     from axolotl.integrations.base import get_builtin_plugins
     from axolotl.utils.schemas import config as config_schema
+    from axolotl.utils.schemas.activation_checkpointing import (
+        migrate_legacy_checkpointing_keys,
+    )
+
+    # before any validator, so plugin and cross-key validators only see the block
+    warning = migrate_legacy_checkpointing_keys(cfg)
+    if warning:
+        LOG.warning(warning)
 
     if cfg.plugins or get_builtin_plugins():
         AxolotlConfigWCapabilities, AxolotlInputConfig = merge_input_args()

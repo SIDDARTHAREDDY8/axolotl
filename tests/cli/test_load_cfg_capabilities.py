@@ -1,9 +1,10 @@
 """Tests for GPU capability detection in `load_cfg` and `ray_train_func`."""
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from axolotl.cli.config import load_cfg
+from axolotl.cli.config import gpu_capabilities, load_cfg
 from axolotl.cli.train import ray_train_func
 
 _BASE_CONFIG = """
@@ -52,6 +53,27 @@ def _patch_load_cfg_dependencies(monkeypatch, validate_mock=None):
     monkeypatch.setattr(
         "axolotl.cli.config.TELEMETRY_MANAGER.send_event", lambda *_, **__: None
     )
+
+
+def test_gpu_capabilities_reports_native_bf16_only(monkeypatch):
+    """`gpu_capabilities` must report emulated bf16 as unsupported, so the
+    dumped config on a Turing GPU shows `bf16: false` (see #4304)."""
+    monkeypatch.setattr(
+        "axolotl.cli.config.is_native_bf16_gpu_available", lambda: False
+    )
+    monkeypatch.setattr(
+        "axolotl.cli.config.is_torch_tf32_available", lambda: False
+    )
+    monkeypatch.setattr("axolotl.cli.config.compute_supports_fp8", lambda: False)
+    monkeypatch.setattr(
+        "axolotl.cli.config.torch.cuda.get_device_properties",
+        lambda *_: SimpleNamespace(major=7, minor=5),
+    )
+
+    capabilities, _ = gpu_capabilities()
+
+    assert capabilities["bf16"] is False
+    assert capabilities["compute_capability"] == "sm_75"
 
 
 def test_load_cfg_probes_capabilities_by_default(tmp_path, monkeypatch):
